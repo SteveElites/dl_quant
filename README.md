@@ -79,21 +79,57 @@ prints a verdict; an AUROC that does not clear them is not reported as a result.
 
 ## Result 3 — in-context structure learning
 
-*To fill in after `python train.py --task incontext`.*
+Trained on the in-context task (8,000 steps, ~7 min on CPU, 411,520 parameters).
 
-| Metric | Value |
-|---|---|
-| Accuracy, predictable positions | — / 0.960 |
-| Val loss | — / 0.223 |
-| AUROC, best head (restricted set) | — |
-| Position-only baseline | ~0.53 |
-| Parent ablation Δ | — |
-| Mass-matched control Δ | — |
+| Metric | Value | Reference |
+|---|---|---|
+| Accuracy, predictable positions | **0.9591** | ceiling 0.9600 |
+| Val loss, all targets | **0.4046** | all-target ceiling 0.4003 (**+1.1%**) |
+| AUROC, best head (restricted set) | **0.8478** | offset-only 0.5373, recency-only 0.4863 |
+| Parent ablation | loss 1.9525 | **+1.548 nats**, above uniform (log 5 = 1.609) |
+| Count-matched control | loss 0.4045 | **−0.0001 nats** |
 
-The mass-matched control is the comparison that can actually fail: it removes
-the same total attention weight as the parent ablation, but from non-parent
-candidate cells. A large parent Δ against a small matched Δ is evidence the
-routing is functional rather than incidental.
+**The model is essentially Bayes-optimal.** Accuracy sits 0.0009 below the
+ceiling and loss 1.1% above it. Note that the all-target ceiling (0.4003) is the
+right comparison, not the predictable-only figure (0.2234): the loss is averaged
+over every target, including the prefix and the `t=0` block, which are
+unpredictable by construction.
+
+**Attention clears the position baselines by a wide margin** — 0.848 against
+0.537, on a scoring set where position carries no information.
+
+**The structure is confined to layer 1:**
+
+```
+             head0   head1   head2   head3
+layer 0     0.4977  0.5028  0.4947  0.5029     <- all at chance
+layer 1     0.6621  0.8478  0.5769  0.6563
+```
+
+Every first-layer head is at chance while the second layer carries the signal.
+The routing is not available from the raw embedding: layer 0 has to move prefix
+information into position before layer 1 can act on it. That is a composition
+signature, and it is the most interesting thing in the project.
+
+**Ablation.** Suppressing the best head's attention to true parent positions
+raises loss by 1.548 nats, to 1.9525 — *above* the uniform-prediction level of
+`log 5 = 1.609`. Removing the head does not merely leave the model uninformed,
+it leaves it confidently wrong.
+
+### Caveat on the control
+
+The control removes the same **count** of cells, not the same attention mass.
+Mass matching was attempted and is not achievable here: the head places ~0.77 of
+its mass on the single parent cell and ~0.016 across the other four candidates,
+so the parent ablation removes 57.8 units of mass per sequence while the entire
+non-parent candidate pool holds only 1.19. There is no comparable mass to match
+against.
+
+That the control cannot be constructed is itself a measurement of how sharp the
+head is, but it does mean the near-zero control delta is weaker evidence than a
+true mass-matched comparison would be. A wrong-parent ablation — same count,
+same structural role, different identity — is the stronger control and is the
+next thing to run.
 
 ## Layout
 
@@ -143,6 +179,7 @@ baselines strong enough to falsify it.
 
 ## Open
 
+- wrong-parent ablation as a stronger control than count matching
 - ablate depth (1 vs 2 layers) and positional encoding scheme
 - vary graph density and `ε`; find where recovery degrades
 - prefix-free variant: infer the graph purely from the observed prefix of the
