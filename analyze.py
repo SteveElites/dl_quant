@@ -1,148 +1,228 @@
-import torch
+"""
+Does attention route according to the causal structure, and does it matter?
+
+    python analyze.py --task incontext --ckpt model_incontext.pt
+
+Reports, in order:
+
+  1. accuracy vs the Bayes ceiling
+  2. edge-recovery AUROC, ALONGSIDE two position-only baselines
+  3. ablation: parent cells vs an attention-weight-MATCHED control
+
+Two design points that the first version of this file got wrong, both of which
+inflated the result:
+
+  * Scoring over every allowed cell rewards recency. Parents always sit within
+    the last ~d tokens while most negatives are far away, so "attend nearby"
+    reaches AUROC ~0.95 having learned nothing. Scoring is therefore restricted
+    to the candidate block the parent is actually drawn from, where position-only
+    baselines sit at chance. The baselines are computed and printed every run --
+    an AUROC that does not clear them is not a result.
+
+  * Ablating randomly chosen non-parent cells removes almost no attention mass,
+    so a near-zero effect there is close to a tautology. The control here matches
+    the total attention mass removed, which is the comparison that can fail.
+"""
+
+import argparse
+
 import numpy as np
+import torch
+import torch.nn.functional as F
 
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+from model import CausalTransformer, NEG_INF
 
-# Reload data (must use same seed)
-data = make_dataset(d=5, K=5, T=12, n_train=20000, n_val=2000,
-                    eps=0.05, n_inst=1, n_lag=1, seed=0)
-cfg = data['config']
-vocab_size = cfg['vocab_size']
-seq_len = cfg['seq_len']
-adjacency = data['adjacency']  # numpy bool [L, L]
-d = cfg['d']
+TRAPZ = getattr(np, "trapz", None) or np.trapezoid   # np.trapz removed in NumPy 2.0
 
-# Load model
-model = CausalTransformer(vocab_size, seq_len).to(DEVICE)
-model.load_state_dict(torch.load("model.pt", map_location=DEVICE))
-model.eval()
 
-val_tokens = torch.tensor(data['val'], dtype=torch.long, device=DEVICE)
+def auroc(scores, labels):
+    scores = np.asarray(scores, dtype=float)
+    labels = np.asarray(labels, dtype=bool)
+    if labels.sum() == 0 or (~labels).sum() == 0:
+        return float("nan")
+    order = np.argsort(-scores)
+    y = labels[order]
+    tp, fp = np.cumsum(y), np.cumsum(~y)
+    return float(TRAPZ(tp / tp[-1], fp / fp[-1]))
 
-# 1. Compute mean attention over validation set (first 512 samples)
-n_samples = min(512, len(val_tokens))
-attn_sum = None
-with torch.no_grad():
-    for i in range(0, n_samples, 128):
-        batch = val_tokens[i:i+128]
-        _, attns = model(batch)
-        stacked = torch.stack([a.mean(0) for a in attns])  # [layers, H, L, L]
-        if attn_sum is None:
-            attn_sum = stacked
-        else:
-            attn_sum += stacked
-mean_attn = (attn_sum / ((n_samples + 127) // 128)).cpu().numpy()  # [layers, H, L, L]
 
-# 2. Edge-recovery AUROC (per head)
-def edge_auroc(attn_maps, adjacency):
-    L = adjacency.shape[0]
-    n_layers, n_heads = attn_maps.shape[:2]
-    per_head = np.zeros((n_layers, n_heads))
-    for layer in range(n_layers):
-        for head in range(n_heads):
-            scores = []
-            labels = []
-            for p in range(1, L):
-                row = p - 1
-                for q in range(row + 1):
-                    scores.append(attn_maps[layer, head, row, q])
-                    labels.append(adjacency[p, q])
-            scores = np.array(scores)
-            labels = np.array(labels, dtype=bool)
-            if labels.sum() == 0 or (~labels).sum() == 0:
-                auroc = np.nan
-            else:
-                order = np.argsort(-scores)
-                y = labels[order]
-                tp = np.cumsum(y)
-                fp = np.cumsum(~y)
-                auroc = np.trapz(tp / tp[-1], fp / fp[-1])   # works with numpy >=1.23
-            per_head[layer, head] = auroc
-    best = np.nanmax(per_head)
-    best_idx = np.unravel_index(np.nanargmax(per_head), per_head.shape)
+@torch.no_grad()
+def collect(model, val, d, T, n_seq, inst_pa, lag_pa, batch=64):
+    """Per-sequence attention scored against that sequence's own graph.
+
+    Attention maps are NOT averaged across sequences here: with a different
+    graph per sequence, the mean map is meaningless.
+    """
+    from data_incontext import adjacency_for, lag_candidate_pairs
+    pairs = list(lag_candidate_pairs(d, T))
+    rows = np.array([r for _, r, _ in pairs])
+    cols = np.array([q for _, _, q in pairs])
+
+    per_head, labels_all, offsets = [], [], np.array([r - q for _, r, q in pairs])
+    for i in range(0, n_seq, batch):
+        b = val[i:i + batch]
+        _, attns = model(b)
+        A = torch.stack(attns, 0)                    # [Lay, B, H, L, L]
+        sel = A[:, :, :, rows, cols].cpu().numpy()   # [Lay, B, H, P]
+        per_head.append(sel)
+        for s in range(b.size(0)):
+            adj = adjacency_for(inst_pa[i + s], lag_pa[i + s], d, T)
+            labels_all.append(adj[[p for p, _, _ in pairs], cols])
+    sel = np.concatenate(per_head, axis=1)           # [Lay, N, H, P]
+    labels = np.concatenate(labels_all)              # [N*P]
+    n_lay, N, n_head, P = sel.shape
+    flat = sel.transpose(0, 2, 1, 3).reshape(n_lay, n_head, N * P)
+    return flat, labels, np.tile(offsets, N), (rows, cols, pairs)
+
+
+def position_baselines(offsets, labels):
+    rate = {o: labels[offsets == o].mean() for o in np.unique(offsets)}
     return {
-        'per_head': per_head,
-        'best_head': best,
-        'best_head_index': best_idx,
-        'mean_head': np.nanmean(per_head),
+        "offset_only": auroc([rate[o] for o in offsets], labels),
+        "recency_only": auroc(-offsets, labels),
     }
 
-auroc_res = edge_auroc(mean_attn, adjacency)
-print("AUROC per head:")
-print(auroc_res['per_head'])
-print(f"Best head: {auroc_res['best_head']:.4f} at index {auroc_res['best_head_index']}")
-print(f"Mean over heads: {auroc_res['mean_head']:.4f}")
 
-# 3. Ablation for the best head
-best_layer, best_head = auroc_res['best_head_index']
-print(f"\nRunning ablation on layer {best_layer}, head {best_head}")
+@torch.no_grad()
+def ablate(model, val, n_seq, vocab, layer, head, rows, cols, pairs,
+           inst_pa, lag_pa, d, T, seed=0, batch=64):
+    """Parent ablation vs an attention-mass-matched control."""
+    from data_incontext import adjacency_for
+    rng = np.random.default_rng(seed)
+    n_heads = model.blocks[0].attn.n_heads
+    L = model.seq_len
+    base = par = ctl = 0.0
+    n_tok = 0
+    mass_par = mass_ctl = 0.0
 
-# Build parent positions to ablate
-L = adjacency.shape[0]
-ablate_positions = []
-for p in range(1, L):
-    row = p - 1
-    for q in range(row + 1):
-        if adjacency[p, q]:
-            ablate_positions.append((row, q))
-print(f"Total parent edges to ablate: {len(ablate_positions)}")
+    for i in range(0, n_seq, batch):
+        b = val[i:i + batch]
+        B = b.size(0)
+        logits, attns = model(b)
+        w = attns[layer][:, head].cpu().numpy()      # [B, L, L]
 
-# Random ablation: sample same number of non‑parent positions
-rng = np.random.default_rng(0)
-all_non_parent = []
-for p in range(1, L):
-    row = p - 1
-    for q in range(row + 1):
-        if not adjacency[p, q]:
-            all_non_parent.append((row, q))
-if len(all_non_parent) < len(ablate_positions):
-    print("Warning: not enough non-parent positions, using all")
-    random_positions = all_non_parent
-else:
-    indices = rng.choice(len(all_non_parent), size=len(ablate_positions), replace=False)
-    random_positions = [all_non_parent[i] for i in indices]
+        bias_p = torch.zeros(B, n_heads, L, L, device=b.device)
+        bias_c = torch.zeros(B, n_heads, L, L, device=b.device)
+        for s in range(B):
+            adj = adjacency_for(inst_pa[i + s], lag_pa[i + s], d, T)
+            is_par = np.array([adj[p, q] for p, _, q in pairs])
+            pr, pc = rows[is_par], cols[is_par]
+            bias_p[s, head, pr, pc] = NEG_INF
+            mass_par += w[s, pr, pc].sum()
 
-# Create bias tensors (B=1, later expanded inside forward if needed)
-def make_bias(positions, head_idx, L, n_heads=4, device='cpu'):
-    bias = torch.zeros(1, n_heads, L, L, device=device)
-    for row, col in positions:
-        bias[:, head_idx, row, col] = float("-inf")
-    return bias
+            # match the removed mass using non-parent candidate cells
+            nr, nc = rows[~is_par], cols[~is_par]
+            wts = w[s, nr, nc]
+            target = w[s, pr, pc].sum()
+            order = rng.permutation(len(nr))
+            got, chosen = 0.0, []
+            for k in order:
+                if got >= target:
+                    break
+                chosen.append(k)
+                got += wts[k]
+            chosen = np.array(chosen, dtype=int)
+            if len(chosen):
+                bias_c[s, head, nr[chosen], nc[chosen]] = NEG_INF
+                mass_ctl += got
 
-bias_parent = make_bias(ablate_positions, best_head, L, device=DEVICE)
-bias_random = make_bias(random_positions, best_head, L, device=DEVICE)
+        tgt = b[:, 1:].reshape(-1)
+        for bias, acc in ((None, "base"), (bias_p, "par"), (bias_c, "ctl")):
+            lg, _ = model(b, attn_biases=[bias if j == layer else None
+                                          for j in range(len(model.blocks))])
+            v = F.cross_entropy(lg[:, :-1].reshape(-1, vocab), tgt,
+                                reduction="sum").item()
+            if acc == "base": base += v
+            elif acc == "par": par += v
+            else: ctl += v
+        n_tok += tgt.numel()
 
-# Compute losses on a validation subset
-val_subset = val_tokens[:256]
-vocab = vocab_size
+    return {"base": base / n_tok, "parent": par / n_tok, "matched": ctl / n_tok,
+            "d_parent": (par - base) / n_tok, "d_matched": (ctl - base) / n_tok,
+            "mass_parent": mass_par / n_seq, "mass_matched": mass_ctl / n_seq}
 
-def loss_with_biases(bias_list):
-    # bias_list: list of biases per layer (None for untouched layers)
-    with torch.no_grad():
-        logits, _ = model(val_subset, attn_biases=bias_list)
-        loss = torch.nn.functional.cross_entropy(
-            logits[:, :-1].reshape(-1, vocab),
-            val_subset[:, 1:].reshape(-1)
-        ).item()
-    return loss
 
-# Base loss (no bias)
-base_loss = loss_with_biases([None] * len(model.blocks))
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--task", choices=["incontext"], default="incontext")
+    ap.add_argument("--ckpt", default="model_incontext.pt")
+    ap.add_argument("--n-seq", type=int, default=256)
+    ap.add_argument("--figures", action="store_true")
+    args = ap.parse_args()
 
-# Parent ablation
-biases_parent = [None] * len(model.blocks)
-biases_parent[best_layer] = bias_parent
-loss_parent = loss_with_biases(biases_parent)
+    from data_incontext import make_dataset
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    data = make_dataset(d=5, K=5, T=16, n_train=10, n_val=args.n_seq, seed=0)
+    cfg = data["config"]
+    d, T = cfg["d"], cfg["T"]
 
-# Random ablation
-biases_random = [None] * len(model.blocks)
-biases_random[best_layer] = bias_random
-loss_random = loss_with_biases(biases_random)
+    ck = torch.load(args.ckpt, map_location=device)
+    sd = ck["state_dict"] if "state_dict" in ck else ck
+    n_layers = len({k.split(".")[1] for k in sd if k.startswith("blocks.")})
+    model = CausalTransformer(cfg["vocab_size"], cfg["seq_len"], n_layers=n_layers).to(device)
+    model.load_state_dict(sd)
+    model.eval()
 
-print(f"Base loss:        {base_loss:.4f}")
-print(f"Parent ablation:  {loss_parent:.4f}  (Δ = {loss_parent - base_loss:.4f})")
-print(f"Random ablation:  {loss_random:.4f}  (Δ = {loss_random - base_loss:.4f})")
+    val = torch.as_tensor(data["val"], dtype=torch.long, device=device)
+    inst_pa, lag_pa = data["val_inst_pa"], data["val_lag_pa"]
 
-# The headline result
-print("\n--- Headline ---")
-print(f"Parent Δ - Random Δ = {(loss_parent - base_loss) - (loss_random - base_loss):.4f}")
+    from train import evaluate
+    vl, acc = evaluate(model, val, data["predictable"], cfg["vocab_size"])
+    model.eval()
+    print(f"val loss {vl:.4f} (ceiling {data['ceiling']['loss']:.4f}) | "
+          f"acc {acc:.4f} (ceiling {data['ceiling']['accuracy']:.4f})")
+
+    flat, labels, offsets, (rows, cols, pairs) = collect(
+        model, val, d, T, args.n_seq, inst_pa, lag_pa)
+
+    base = position_baselines(offsets, labels)
+    print(f"\nposition-only baselines: offset {base['offset_only']:.4f}, "
+          f"recency {base['recency_only']:.4f}  (chance 0.5)")
+
+    n_lay, n_head, _ = flat.shape
+    per_head = np.zeros((n_lay, n_head))
+    for l in range(n_lay):
+        for h in range(n_head):
+            per_head[l, h] = auroc(flat[l, h], labels)
+    print("AUROC per head:\n", np.round(per_head, 4))
+    bl, bh = np.unravel_index(np.nanargmax(per_head), per_head.shape)
+    best = per_head[bl, bh]
+    print(f"best head: layer {bl}, head {bh} -> {best:.4f}")
+    print("VERDICT:", "clears position-only baselines"
+          if best > max(base.values()) + 0.02 else
+          "DOES NOT clear position-only baselines -- no evidence of structure use")
+
+    res = ablate(model, val, args.n_seq, cfg["vocab_size"], bl, bh,
+                 rows, cols, pairs, inst_pa, lag_pa, d, T)
+    print(f"\nbase loss        {res['base']:.4f}")
+    print(f"parent ablation  {res['parent']:.4f}  (delta +{res['d_parent']:.4f}, "
+          f"mass {res['mass_parent']:.2f}/seq)")
+    print(f"matched control  {res['matched']:.4f}  (delta +{res['d_matched']:.4f}, "
+          f"mass {res['mass_matched']:.2f}/seq)")
+    print(f"headroom to no-structure: {np.log(cfg['K']) - data['ceiling']['loss']:.4f} nats")
+    print(f"parent delta is {100*res['d_parent']/(np.log(cfg['K'])-data['ceiling']['loss']):.1f}% of headroom")
+
+    if args.figures:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from data_incontext import adjacency_for
+        with torch.no_grad():
+            _, attns = model(val[:1])
+        w = attns[bl][0, bh].cpu().numpy()
+        adj = adjacency_for(inst_pa[0], lag_pa[0], d, T)
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.imshow(w, cmap="magma")
+        py, px = np.where(adj)
+        ax.scatter(px, py - 1, s=8, facecolors="none", edgecolors="cyan", lw=0.6,
+                   label="true parent (row p-1)")
+        ax.set_title(f"layer {bl} head {bh} — AUROC {best:.3f} "
+                     f"(baselines {max(base.values()):.3f})")
+        ax.set_xlabel("key position"); ax.set_ylabel("query position")
+        ax.legend(loc="lower left", fontsize=8)
+        fig.tight_layout(); fig.savefig("figures/attention_best_head.png", dpi=150)
+        print("wrote figures/attention_best_head.png")
+
+
+if __name__ == "__main__":
+    main()

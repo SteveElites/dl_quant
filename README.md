@@ -1,118 +1,149 @@
 # Does attention recover causal structure?
 
-A decoder‑only transformer written from scratch, trained on sequences generated
-from a known sparse causal graph, and tested on whether its attention maps
-recover the generating structure — and whether that structure is actually used.
+A decoder-only transformer written from scratch, trained on sequences generated
+from a known causal graph, then tested on whether its attention routes according
+to that graph — and whether the routing is load-bearing.
 
-## The setup
+The headline finding is negative and the negative result is the point: the
+obvious version of this experiment cannot distinguish structure learning from
+positional heuristics, and most of the work here is building a measurement that
+can.
+
+## Setup
 
 `d` discrete variables over a prime alphabet `{0..K-1}`, unrolled for `T`
-timesteps and flattened so that position `p = t*d + i` holds variable `i` at
-time `t`. Each variable has a sparse parent set: some instantaneous (earlier
-variables in the same timestep), some lagged (any variable at `t-1`). Values
-follow a random linear rule mod `K`, corrupted with probability `ε`.
+timesteps and flattened so position `p = t*d + i` holds variable `i` at time `t`.
+Each variable has one instantaneous parent (an earlier variable in the same
+timestep) and one lagged parent (any variable at `t-1`). Values follow a linear
+rule mod `K`, corrupted with probability `ε`.
 
-Because the graph is known, three things are known that usually aren't:
+Two variants:
 
-- **the Bayes ceiling** — `(1-ε) + ε/K` on predictable positions, so model
-  accuracy can be reported against what is actually achievable
-- **the target attention pattern** — to predict position `p`, the model must
-  read the positions holding `p`'s parents
-- **which ablations should matter** — attention to parents is load‑bearing,
-  attention elsewhere should not be
+| | `data.py` | `data_incontext.py` |
+|---|---|---|
+| Graph | one, fixed across the dataset | fresh per sequence |
+| Specified how | implicit | token prefix the model must read |
+| Sequence length | 60 | 91 (11 prefix + 80 data) |
 
-## Results
+## Result 1 — the fixed-graph setting is not measurable
+
+Trained model, best head: **AUROC 0.768** at separating parent from non-parent
+positions.
+
+Position-only baselines on the same scoring set:
+
+| Scorer | AUROC |
+|---|---|
+| Offset-only (parent rate by distance, no model) | **0.968** |
+| Recency-only (`score = -distance`) | **0.926** |
+| Trained model, best head | 0.768 |
+
+The model scores *below* a scorer with no parameters. With one fixed graph,
+parents always sit at the same offsets, so "recover the graph" and "memorise two
+offsets" are the same task and AUROC cannot separate them.
+
+The ablation is similarly weak. Total headroom between using the structure and
+not using it is `log K − H(ε) ≈ 1.386` nats. Single-head parent ablation moved
+loss by **0.085**, about **6%** of that. That indicates redundancy across heads
+and the MLP, not — as an earlier draft of this README claimed — a single head
+carrying the task.
+
+The control was also too generous: ablating randomly chosen non-parent cells
+removes near-zero attention mass, so its ~0.0002 effect was close to a tautology.
+
+## Result 2 — fixing the data is not enough; the metric is the problem
+
+Giving each sequence its own graph (`data_incontext.py`) should kill the
+positional confound. It does not, on its own:
+
+| Scorer, in-context task, all allowed cells | AUROC |
+|---|---|
+| Offset-only | 0.946 |
+| Recency-only | 0.946 |
+
+Parents are always *recent* — within the last ~`d` tokens — while the negative
+set is dominated by far-away cells no attention pattern would visit. Recency
+alone still nearly solves it.
+
+The fix is to score only against the candidate set the parent is actually drawn
+from: the `d` cells of the previous timestep block (`lag_candidate_pairs`).
+
+| Scorer, restricted candidate set | AUROC |
+|---|---|
+| Offset-only | 0.535 |
+| Recency-only | 0.486 |
+
+Now position carries no information and anything above 0.5 has to come from
+reading the prefix. `analyze.py` recomputes both baselines on every run and
+prints a verdict; an AUROC that does not clear them is not reported as a result.
+
+## Result 3 — in-context structure learning
+
+*To fill in after `python train.py --task incontext`.*
 
 | Metric | Value |
-|--------|-------|
-| Accuracy (predictable positions) | **0.94** (from training logs) |
-| … against ceiling | **0.96** (ε=0.05, K=5) |
-| Edge‑recovery AUROC, best head | **0.7678** (layer 0, head 1) |
-| Loss increase, parent ablation | **+0.0850** |
-| Loss increase, random ablation | **+0.0002** |
+|---|---|
+| Accuracy, predictable positions | — / 0.960 |
+| Val loss | — / 0.223 |
+| AUROC, best head (restricted set) | — |
+| Position-only baseline | ~0.53 |
+| Parent ablation Δ | — |
+| Mass-matched control Δ | — |
 
-**Headline gap** (parent Δ − random Δ): **+0.0848**  
-*This gap is the main result: the model does not merely show a correlation – it actually uses the parent structure to make predictions.*
-
-## What we found
-
-- The best attention head (layer 0, head 1) achieves an AUROC of **0.77** at distinguishing true parent positions from non‑parents. This is well above chance (0.5) and shows that the attention pattern has learned the causal graph.
-- When we force that head to ignore the true parents (by setting those attention weights to `‑inf` before softmax), the next‑token cross‑entropy loss jumps by **0.085**. 
-- When we ablate the same number of randomly chosen non‑parent positions, the loss barely moves (+0.0002). This interventional check confirms that the attention to parents is **functional** – it is not a spurious correlation.
-- The other heads show lower AUROC values (see visualisations), suggesting that the first layer’s head 1 specialises in structural reading, while the rest may handle residual or positional information.
+The mass-matched control is the comparison that can actually fail: it removes
+the same total attention weight as the parent ablation, but from non-parent
+candidate cells. A large parent Δ against a small matched Δ is evidence the
+routing is functional rather than incidental.
 
 ## Layout
 
+```
+model.py             attention, block, transformer, plus five correctness checks
+data.py              fixed-graph generator (Result 1)
+data_incontext.py    per-sequence graph, prefix encoding, restricted scoring set
+train.py             training loop for either task
+analyze.py           AUROC, position baselines, mass-matched ablation, figures
+```
 
+## Running it
 
+```bash
+python model.py                                  # correctness checks 1-5
+python data_incontext.py                         # generator sanity output
+python train.py --task incontext --steps 8000
+python analyze.py --ckpt model_incontext.pt --figures
+```
 
+Minutes on a laptop; the model is ~400k parameters.
 
+## Correctness checks
 
+`model.py` runs five: output shapes, attention rows summing to one, the causal
+mask (both a triangularity assert and a future-perturbation test), agreement
+with `F.scaled_dot_product_attention` as a reference oracle, and overfitting a
+single batch to near-zero loss.
 
-## Build order
+## Two things that are easy to get wrong
 
-**Session 1 — data.** Run `python src/data.py`. Read the output until the
-parent sets, the sequences and the rule‑holds figure all make sense together.
-Check the marginal entropy sits at `log K`; if it doesn't, the dynamics have
-collapsed and the task is easier than it looks.  
-*(Our run gave `H ≈ 1.609` nats for K=5, matching `log(5)`.)*
-
-**Session 2 — model.** Fill in the TODOs in `model.py`. Run
-`python src/model.py` and get checks 1–5 passing. Check 5, overfitting a single
-batch to near‑zero loss, is the one that matters — we verified it before starting
-training.
-
-**Session 3 — train.** AdamW, lr 3e‑4 with cosine decay, batch 64, ~5k steps.
-Log train and val loss, and val accuracy against the ceiling. This should take
-minutes on a laptop. Watch for the curve to sit at chance for a while and then
-drop sharply — the structure has to be found before it can be exploited.  
-*(Our training showed the model reaching ~94% accuracy on predictable positions,
-against a ceiling of 96%.)*
-
-**Session 4 — analysis.** Add the `attn_bias` argument to your attention module
-(described in `analyze.py`), then run the AUROC and the two ablations. Plot the
-mean attention maps with true‑parent cells outlined.  
-*(The best head’s heatmap clearly shows brighter cells at the parent positions;
-see figures in the full report.)*
-
-**Session 5 — write‑up.** Fill in the results table. One figure: mean attention
-map for the best head with ground‑truth edges marked. Add a short section on
-what surprised you.
-
-## What surprised me
-
-- The first layer’s head 1 learned almost all of the structure; the second layer did not significantly improve AUROC, suggesting that a single layer is sufficient for this task (lagged edges are one step away, so no deep composition is required).
-- The ablation delta was much larger than expected — I initially thought the model might have multiple redundant heads, but removing just one head’s parent attention caused a clear performance drop. This suggests the model is efficient: it allocates one head to the causal task and relies on it heavily.
-- The attention maps were clean and interpretable even with only 5k training steps — the inductive bias of the transformer (causal masking + position embeddings) seems well‑suited to recovering this kind of sparse dependency structure.
-
-## Ablations worth running if there's time
-
-- learned vs sinusoidal positional encodings — position encodes variable
-  identity here, so the choice should matter more than usual
-- depth 1 vs 2 — can a single layer do it, or is composition needed for the
-  lagged edges?
-- graph density (`n_inst`, `n_lag`) — where does recovery break down?
-- noise `ε` — how does AUROC degrade as the rule gets less deterministic?
-
-*(We only ran the default configuration; the above are left as future work.)*
-
-## Two things to be careful about
-
-**The off‑by‑one.** The head at position `p-1` predicts the token at position
-`p`. So the attention row scored against `adjacency[p]` is row `p-1`. Getting
-this wrong gives maps that look nearly right and an AUROC at chance.  
-*(We verified this carefully in our analysis.)*
+**The off-by-one.** The head at position `p-1` predicts the token at position
+`p`, so the attention row scored against `adjacency[p]` is row `p-1`. Getting
+this wrong yields maps that look nearly right and an AUROC at chance.
 
 **Unreachable parents.** Instantaneous parents of the first variable in a
-timestep sit at or after `p-1` and are masked out by construction, so they're
-excluded from scoring. Noticing this is a point in your favour, not a caveat to
-hide.  
-*(Our scoring only considers `q <= p-1`, so this is handled correctly.)*
+timestep sit at or after `p-1` and are masked out by construction, so they are
+excluded from scoring.
 
-## Honest scope
+## Scope
 
-This is a controlled synthetic setting. It says nothing directly about whether
-attention in a language model recovers causal structure in natural data — the
-ground truth exists here precisely because the data was constructed. What it
-does give is a testbed where interpretability claims can be checked against a
-known answer instead of assessed by eye.
+This is a controlled synthetic setting. It says nothing directly about attention
+in language models trained on natural data — the ground truth exists here
+precisely because the data was constructed. What it provides is a testbed where
+an interpretability claim can be checked against a known answer and against
+baselines strong enough to falsify it.
+
+## Open
+
+- ablate depth (1 vs 2 layers) and positional encoding scheme
+- vary graph density and `ε`; find where recovery degrades
+- prefix-free variant: infer the graph purely from the observed prefix of the
+  sequence, with no explicit encoding

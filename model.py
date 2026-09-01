@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+NEG_INF = -1e9
+
 
 class MultiHeadSelfAttention(nn.Module):
     """Causal multi-head self-attention.
@@ -43,11 +45,14 @@ class MultiHeadSelfAttention(nn.Module):
 
         scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
 
-        # apply causal mask
+        # Causal mask. NEG_INF is a large finite value rather than -inf: the
+        # ablation path adds a second negative bias on top of this, and if a row
+        # ever ends up fully suppressed, -inf everywhere makes softmax return
+        # NaN while a finite value degrades gracefully to a uniform row.
         mask = torch.triu(torch.ones(L, L, device=x.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(mask, float("-inf"))
+        scores = scores.masked_fill(mask, NEG_INF)
 
-        # add attn_bias (used for ablation) – shape [B, H, L, L] or broadcastable
+        # attn_bias is used for ablation: [B, H, L, L] or broadcastable
         if attn_bias is not None:
             scores = scores + attn_bias
 
