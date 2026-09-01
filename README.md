@@ -35,10 +35,10 @@ Because the graph is known, three things are known that usually aren't:
 ## Layout
 
 ```
-src/data.py      generator, ground-truth adjacency, Bayes ceiling   [done]
-src/model.py     attention, block, transformer                      [you]
-src/train.py     training loop, logging                             [you]
-src/analyze.py   AUROC, ablation, figures                           [partly]
+src/data.py      generator, ground-truth adjacency, Bayes ceiling   
+src/model.py     attention, block, transformer                      
+src/train.py     training loop, logging                             
+src/analyze.py   AUROC, ablation, figures                           
 ```
 
 ## Build order

@@ -1,17 +1,7 @@
 """
 Decoder-only transformer, written from scratch.
 
-You implement every TODO. Do not import nn.Transformer, nn.MultiheadAttention,
-or F.scaled_dot_product_attention in the model itself -- the whole point of the
-project is that you wrote the attention. (The test at the bottom uses SDPA as a
-reference oracle, which is fine and is exactly how you'd check it in practice.)
-
-Run `python src/model.py` at any point. It runs five correctness checks. Get all
-five passing before you go near the training loop; every hour spent debugging a
-training run that was actually a broken mask is an hour wasted.
-
 Target size: d_model=128, n_heads=4, n_layers=2, d_ff=512, ~200k params.
-Small on purpose -- 8 attention maps total, all of them readable.
 """
 
 import math
@@ -27,9 +17,6 @@ class MultiHeadSelfAttention(nn.Module):
         x    : [B, L, d_model]
         out  : [B, L, d_model]
         attn : [B, n_heads, L, L]   post-softmax weights, kept for analysis
-
-    Returning attn is not optional here -- analyze.py scores these maps against
-    the ground-truth graph, so make sure they survive the forward pass.
     """
 
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
@@ -38,43 +25,60 @@ class MultiHeadSelfAttention(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        # TODO: q, k, v projections and the output projection.
-        #       One fused nn.Linear(d_model, 3*d_model) is idiomatic; three
-        #       separate ones are easier to read. Either is fine.
-        # TODO: dropout module if you want it.
-        raise NotImplementedError
 
-    def forward(self, x):
-        B, L, _ = x.shape
-        # TODO: project to q, k, v
-        # TODO: reshape to [B, n_heads, L, d_head]
-        # TODO: scores = q @ k^T / sqrt(d_head)          -> [B, H, L, L]
-        # TODO: causal mask -- position i may attend to j <= i only.
-        #       torch.triu(torch.ones(L, L), diagonal=1).bool() marks the
-        #       forbidden cells; masked_fill them with -inf BEFORE softmax.
-        #       Build the mask on x.device or you will get a device error the
-        #       first time you touch a GPU.
-        # TODO: attn = softmax(scores, dim=-1)
-        # TODO: out = attn @ v, merge heads, output projection
-        raise NotImplementedError
+        # Fused q, k, v projection
+        self.c_attn = nn.Linear(d_model, 3 * d_model)
+        # Output projection
+        self.c_proj = nn.Linear(d_model, d_model)
+        
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+    def forward(self, x, attn_bias=None):
+        B, L, D = x.shape
+        q, k, v = self.c_attn(x).split(self.d_model, dim=2)
+        q = q.view(B, L, self.n_heads, self.d_head).transpose(1, 2)
+        k = k.view(B, L, self.n_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, L, self.n_heads, self.d_head).transpose(1, 2)
+
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
+
+        # apply causal mask
+        mask = torch.triu(torch.ones(L, L, device=x.device, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(mask, float("-inf"))
+
+        # add attn_bias (used for ablation) – shape [B, H, L, L] or broadcastable
+        if attn_bias is not None:
+            scores = scores + attn_bias
+
+        attn = F.softmax(scores, dim=-1)
+        attn_dropped = self.attn_dropout(attn)
+        out = attn_dropped @ v
+        out = out.transpose(1, 2).contiguous().view(B, L, D)
+        out = self.resid_dropout(self.c_proj(out))
+        return out, attn
 
 
 class Block(nn.Module):
-    """Pre-norm block: x = x + attn(ln1(x)); x = x + mlp(ln2(x)).
-
-    Pre-norm, not post-norm. Post-norm needs learning-rate warmup to train
-    stably at this depth and you do not need that headache.
-    """
+    """Pre-norm block: x = x + attn(ln1(x)); x = x + mlp(ln2(x))."""
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.0):
         super().__init__()
-        # TODO: ln1, attn, ln2, mlp (Linear -> GELU -> Linear)
-        raise NotImplementedError
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = MultiHeadSelfAttention(d_model, n_heads, dropout)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
 
-    def forward(self, x):
-        # TODO: return (x, attn) -- pass the attention map up so the top-level
-        #       model can collect one per layer
-        raise NotImplementedError
+    def forward(self, x, attn_bias=None):
+        attn_out, attn_map = self.attn(self.ln1(x), attn_bias=attn_bias)
+        x = x + attn_out
+        x = x + self.mlp(self.ln2(x))
+        return x, attn_map
 
 
 class CausalTransformer(nn.Module):
@@ -90,28 +94,39 @@ class CausalTransformer(nn.Module):
                  dropout: float = 0.0):
         super().__init__()
         self.seq_len = seq_len
-        # TODO: token embedding [vocab_size, d_model]
-        # TODO: learned positional embedding [seq_len, d_model]
-        #       Learned, not sinusoidal. Position IS the variable identity here
-        #       (position p = t*d + i), so you want the model free to learn
-        #       structure over it. Worth an ablation later.
-        # TODO: stack of Blocks, final layernorm, lm_head to vocab
-        raise NotImplementedError
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.position_embedding = nn.Embedding(seq_len, d_model)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, idx):
-        # TODO: embed tokens + positions, run blocks collecting attn maps,
-        #       final ln, project to logits
-        raise NotImplementedError
+        self.blocks = nn.ModuleList([
+            Block(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)
+        ])
+        
+        self.ln_f = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+    def forward(self, idx, attn_biases=None):
+        B, L = idx.shape
+        assert L <= self.seq_len, f"Sequence length {L} exceeds max seq_len {self.seq_len}"
+
+        pos = torch.arange(0, L, device=idx.device).unsqueeze(0)  # [1, L]
+        tok_emb = self.token_embedding(idx)                       # [B, L, d_model]
+        pos_emb = self.position_embedding(pos)                   # [1, L, d_model]
+
+        x = self.dropout(tok_emb + pos_emb)
+
+        attns = []
+        for i, block in enumerate(self.blocks):
+            bias = attn_biases[i] if attn_biases is not None else None
+            x, attn = block(x, attn_bias=bias)
+            attns.append(attn)
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        return logits, attns
 
     def loss(self, idx):
-        """Next-token cross-entropy. Predict idx[:, 1:] from idx[:, :-1].
-
-        Mind this off-by-one everywhere. The head at position p-1 predicts the
-        token at position p, so when analyze.py asks which positions a
-        prediction attended to, it must read attention ROW p-1, not row p.
-        Getting this wrong produces attention maps that look almost right and
-        an AUROC around chance, and it will cost you a full evening.
-        """
+        """Next-token cross-entropy. Predict idx[:, 1:] from idx[:, :-1]."""
         logits, _ = self(idx)
         return F.cross_entropy(
             logits[:, :-1].reshape(-1, logits.size(-1)),
@@ -156,17 +171,21 @@ def _checks():
     blk = m.blocks[0].attn
     x = torch.randn(B, L, blk.d_model)
     out, _ = blk(x)
-    #    Re-derive q,k,v the same way your forward does, then compare.
-    #    TODO: adapt these three lines to however you named your projections.
-    raise NotImplementedError(
-        "check 4: wire this up to your own q/k/v projections, then compare "
-        "against F.scaled_dot_product_attention(q, k, v, is_causal=True) "
-        "followed by your output projection. Should match to ~1e-5."
-    )
+    
+    # Re-derive q, k, v using fused c_attn and shape for SDPA
+    q, k, v = blk.c_attn(x).split(blk.d_model, dim=2)
+    q = q.view(B, L, blk.n_heads, blk.d_head).transpose(1, 2)
+    k = k.view(B, L, blk.n_heads, blk.d_head).transpose(1, 2)
+    v = v.view(B, L, blk.n_heads, blk.d_head).transpose(1, 2)
+
+    sdpa_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    sdpa_out = sdpa_out.transpose(1, 2).contiguous().view(B, L, blk.d_model)
+    expected_out = blk.resid_dropout(blk.c_proj(sdpa_out))
+
+    assert torch.allclose(out, expected_out, atol=1e-5), "attention output does not match SDPA reference"
+    print("4. matches SDPA oracle    OK")
 
     # 5. can it overfit a single batch to near-zero loss?
-    #    If this fails, the architecture or the optimiser is wrong. Never debug
-    #    a full training run before this passes.
     m2 = CausalTransformer(vocab_size=V, seq_len=L)
     opt = torch.optim.AdamW(m2.parameters(), lr=3e-3)
     batch = torch.randint(0, V, (4, L))
